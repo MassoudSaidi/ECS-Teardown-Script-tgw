@@ -333,7 +333,9 @@ class IAMTerraformDeployerRole(IAMRoles):
                         "iam:ListInstanceProfilesForRole",
                         "iam:ListPolicyVersions",
                         "iam:ListRolePolicies",
-                        "iam:ListPolicies" 
+                        "iam:ListPolicies",
+                        "iam:CreatePolicyVersion",
+                        "iam:DeletePolicyVersion" 
                     ],
                     "Resource": "*"
                 },
@@ -432,7 +434,76 @@ class IAMTerraformDeployerRole(IAMRoles):
                         "apigatewayv2:UntagResource"                        
                     ],
                     "Resource": "*"
-                }                
+                },
+                {
+                    "Sid": "S3Permissions",
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:CreateBucket",
+                        "s3:ListAllMyBuckets",
+                        "s3:GetBucketLocation",
+
+                        # Permissions to manage the bucket itself
+                        "s3:DeleteBucket",
+                        "s3:GetBucketTagging",
+                        "s3:PutBucketTagging",
+                        "s3:GetBucketPolicy",
+                        "s3:PutBucketPolicy",
+                        "s3:DeleteBucketPolicy",
+                        "s3:GetBucketPublicAccessBlock",
+                        "s3:PutBucketPublicAccessBlock",
+                        "s3:GetEncryptionConfiguration",
+                        "s3:PutEncryptionConfiguration",
+                        "s3:GetBucketVersioning",
+                        "s3:PutBucketVersioning",
+
+                        # Permissions to manage objects within the bucket
+                        "s3:ListBucket",
+                        "s3:GetObject",
+                        "s3:PutObject",
+                        "s3:DeleteObject",
+
+                        "s3:GetBucketAcl",
+                        "s3:PutBucketAcl",
+                        "s3:GetBucketCORS",
+                        "s3:PutBucketCORS",
+                        "s3:GetBucketLocation",
+                        "s3:GetBucketLogging",
+                        "s3:PutBucketLogging",
+                        "s3:GetBucketPolicy",
+                        "s3:PutBucketPolicy",
+                        "s3:DeleteBucketPolicy",
+                        "s3:GetBucketPublicAccessBlock",
+                        "s3:PutBucketPublicAccessBlock",
+                        "s3:GetBucketTagging",
+                        "s3:PutBucketTagging",
+                        "s3:GetBucketVersioning",
+                        "s3:PutBucketVersioning",
+                        "s3:GetBucketWebsite",
+                        "s3:PutBucketWebsite",
+                        "s3:DeleteBucketWebsite",
+                        "s3:GetEncryptionConfiguration",
+                        "s3:PutEncryptionConfiguration",
+                        "s3:GetLifecycleConfiguration",
+                        "s3:PutLifecycleConfiguration",
+
+                        "s3:GetAccelerateConfiguration",
+                        "s3:PutAccelerateConfiguration",
+                        "s3:GetBucketRequestPayment",
+                        "s3:PutBucketRequestPayment",
+                        "s3:GetReplicationConfiguration",
+                        "s3:PutReplicationConfiguration",
+                        "s3:GetObjectLockConfiguration",
+                        "s3:PutObjectLockConfiguration",
+                        "s3:GetBucketOwnershipControls",
+                        "s3:PutBucketOwnershipControls",
+                        "s3:GetBucketObjectLockConfiguration",
+                        "s3:PutBucketObjectLockConfiguration",
+                        "s3:ListBucketVersions",
+                        "s3:DeleteObjectVersion"
+                    ],
+                    "Resource": "*"
+                },                                
             ]
         }
 

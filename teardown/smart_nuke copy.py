@@ -23,77 +23,6 @@ def get_boto_clients(region):
 # #          NEW FUNCTIONS TO DELETE API GATEWAY RESOURCES                           #
 # ######################################################################################
 
-def delete_api_gateway_integrations(clients, config):
-    """ Deletes all integrations for a given API Gateway API. """
-    api_id = config.get('API_ID')
-    if not api_id:
-        print("--- No API_ID found, skipping API Gateway integration deletion ---")
-        return
-
-    print(f"--- Deleting integrations for API Gateway: {api_id} ---")
-    try:
-        response = clients['apigatewayv2'].get_integrations(ApiId=api_id)
-        integrations = response.get('Items', [])
-        if not integrations:
-            print("No integrations found.")
-            return
-
-        for integration in integrations:
-            integration_id = integration['IntegrationId']
-            print(f"Deleting integration: {integration_id}")
-            clients['apigatewayv2'].delete_integration(ApiId=api_id, IntegrationId=integration_id)
-        print("All integrations deleted successfully.")
-    except clients['apigatewayv2'].exceptions.NotFoundException:
-        print(f"API Gateway {api_id} not found. Skipping integration deletion.")
-    except Exception as e:
-        print(f"An error occurred while deleting API Gateway integrations: {e}")
-
-def delete_api_gateway_routes(clients, config):
-    """ Deletes all routes for a given API Gateway API. """
-    api_id = config.get('API_ID')
-    if not api_id:
-        print("--- No API_ID found, skipping API Gateway route deletion ---")
-        return
-
-    print(f"--- Deleting routes for API Gateway: {api_id} ---")
-    try:
-        response = clients['apigatewayv2'].get_routes(ApiId=api_id)
-        routes = response.get('Items', [])
-        if not routes:
-            print("No routes found.")
-            return
-
-        for route in routes:
-            route_id = route['RouteId']
-            print(f"Deleting route: {route_id}")
-            clients['apigatewayv2'].delete_route(ApiId=api_id, RouteId=route_id)
-        print("All routes deleted successfully.")
-    except clients['apigatewayv2'].exceptions.NotFoundException:
-        print(f"API Gateway {api_id} not found. Skipping route deletion.")
-    except Exception as e:
-        print(f"An error occurred while deleting API Gateway routes: {e}")
-
-
-def disassociate_capacity_providers_from_cluster(clients, config):
-    """ Disassociates all capacity providers from the ECS cluster. """
-    cluster_name = config.get('CLUSTER_NAME')
-    print(f"--- Disassociating capacity providers from cluster: {cluster_name} ---")
-    try:
-        # This action effectively detaches the aws_ecs_cluster_capacity_providers resource
-        clients['ecs'].put_cluster_capacity_providers(
-            cluster=cluster_name,
-            capacityProviders=[],
-            defaultCapacityProviderStrategy=[]
-        )
-        print(f"Successfully disassociated all capacity providers from {cluster_name}.")
-        # Give it a moment to process the update before deleting the provider
-        time.sleep(15)
-    except clients['ecs'].exceptions.ClusterNotFoundException:
-        print(f"Cluster {cluster_name} not found. Skipping disassociation.")
-    except Exception as e:
-        print(f"An error occurred while disassociating capacity providers: {e}")
-
-
 def delete_api_gateway(clients, config):
     """ Deletes the API Gateway API. """
     api_id = config.get('API_ID')
@@ -300,19 +229,9 @@ def delete_capacity_providers(clients, config):
 def delete_ecs_cluster(clients, config):
     print(f"--- Deleting ECS Cluster: {config['CLUSTER_NAME']} ---")
     try:
-        # Ensure there are no services or tasks left.
-        # This is a safeguard; delete_ecs_service should have handled it.
-        services_response = clients['ecs'].list_services(cluster=config['CLUSTER_NAME'])
-        if services_response.get('serviceArns'):
-            print(f"ERROR: Cluster {config['CLUSTER_NAME']} still has active services. Aborting cluster deletion.")
-            return
-
-        print(f"Proceeding with deletion of cluster: {config['CLUSTER_NAME']}")
         clients['ecs'].delete_cluster(cluster=config['CLUSTER_NAME'])
-        
-        waiter = clients['ecs'].get_waiter('clusters_deleted') 
-        
-        waiter.wait(clusters=[config['CLUSTER_NAME']], WaiterConfig={'Delay': 15, 'MaxAttempts': 60})
+        waiter = clients['ecs'].get_waiter('clusters_inactive')
+        waiter.wait(clusters=[config['CLUSTER_NAME']], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
         print(f"Cluster {config['CLUSTER_NAME']} deleted successfully.")
     except clients['ecs'].exceptions.ClusterNotFoundException:
         print(f"Cluster {config['CLUSTER_NAME']} not found. Skipping.")
@@ -411,45 +330,42 @@ if __name__ == '__main__':
     
     print("\n>>> Starting AWS Resource Destruction Script <<<")
     
-    # ----------------- REVISED AND CORRECTED DESTRUCTION ORDER -----------------
+    # ----------------- UPDATED CRITICAL DESTRUCTION ORDER -----------------
     
     # 1. Remove service auto-scaling dependencies first.
     delete_appautoscaling_policies_and_targets(clients, config)
     
-    # 2. Scale down and delete the ECS service. This detaches it from the Target Group.
+    # 2. Scale down and delete the ECS service.
     delete_ecs_service(clients, config)
     
-    # 3. NEW: Delete API Gateway components that depend on the ALB Listener.
-    # The integration is the key dependency on the listener.
-    delete_api_gateway_integrations(clients, config)
-    delete_api_gateway_routes(clients, config)
+    # 3. NEW: Delete the API Gateway, which depends on the ALB listener.
     delete_api_gateway(clients, config)
     
-    # 4. Now that the API Gateway is gone, delete the ALB and its Target Group.
-    delete_load_balancer_and_target_group(clients, config)
-
-    # 5. The VPC Link is no longer in use by the API Gateway.
+    # 4. NEW: Delete the VPC Link, which depends on subnets and SGs.
+    #    It must be deleted before the ALB and SGs it might reference.
     delete_vpc_link(clients, config)
 
-    # 6. Scale down and delete the ASG, terminating all EC2 instances.
+    # 5. Scale down and delete the ASG, terminating all EC2 instances.
     delete_autoscaling_group_and_instances(clients, config)
+    
+    # 6. Delete the ALB and Target Group.
+    delete_load_balancer_and_target_group(clients, config)
     
     # 7. Delete the Launch Template.
     delete_launch_template(clients, config)
     
-    # 8. NEW: Disassociate the Capacity Provider from the Cluster BEFORE deleting it.
-    disassociate_capacity_providers_from_cluster(clients, config)
-    
-    # 9. Now delete the Capacity Provider itself.
+    # 8. Delete the Capacity Provider.
+    # Note: Ensure CAPACITY_PROVIDER_NAME is set in your config if you use it.
+    # This script will attempt to guess it if not present.
     delete_capacity_providers(clients, config)
     
-    # 10. Delete the now-empty and un-associated ECS Cluster.
+    # 9. Delete the now-empty ECS Cluster.
     delete_ecs_cluster(clients, config)
     
     print("\n--- SKIPPING IAM ROLE DELETION BY DEFAULT (This is a safe practice) ---")
     
-    # 11. Clean up networking resources created by this stack.
-    vpc_id = config.get('VPC_ID')
+    # 10. Clean up networking resources created by this stack.
+    vpc_id = config.get('VPC_ID') # UPDATED: Get VPC ID directly from config.
     if vpc_id:
         print("\nWaiting 60 seconds for network interfaces to detach before deleting security groups...")
         time.sleep(60)
