@@ -356,7 +356,13 @@ class IAMTerraformDeployerRole(IAMRoles):
                         "iam:AddUserToGroup",
                         "iam:RemoveUserFromGroup",
                         "iam:ListUserPolicies",
-                        "iam:ListUsers"
+                        "iam:ListUsers",
+                        "iam:CreateOpenIDConnectProvider",
+                        "iam:GetOpenIDConnectProvider",
+                        "iam:DeleteOpenIDConnectProvider",
+                        "iam:AddClientIDToOpenIDConnectProvider",
+                        "iam:UpdateOpenIDConnectProviderThumbprint",
+                        "iam:GetRolePolicy"
                     ],
                     "Resource": "*"
                 },                
