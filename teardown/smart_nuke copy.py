@@ -23,6 +23,77 @@ def get_boto_clients(region):
 # #          NEW FUNCTIONS TO DELETE API GATEWAY RESOURCES                           #
 # ######################################################################################
 
+def delete_api_gateway_integrations(clients, config):
+    """ Deletes all integrations for a given API Gateway API. """
+    api_id = config.get('API_ID')
+    if not api_id:
+        print("--- No API_ID found, skipping API Gateway integration deletion ---")
+        return
+
+    print(f"--- Deleting integrations for API Gateway: {api_id} ---")
+    try:
+        response = clients['apigatewayv2'].get_integrations(ApiId=api_id)
+        integrations = response.get('Items', [])
+        if not integrations:
+            print("No integrations found.")
+            return
+
+        for integration in integrations:
+            integration_id = integration['IntegrationId']
+            print(f"Deleting integration: {integration_id}")
+            clients['apigatewayv2'].delete_integration(ApiId=api_id, IntegrationId=integration_id)
+        print("All integrations deleted successfully.")
+    except clients['apigatewayv2'].exceptions.NotFoundException:
+        print(f"API Gateway {api_id} not found. Skipping integration deletion.")
+    except Exception as e:
+        print(f"An error occurred while deleting API Gateway integrations: {e}")
+
+def delete_api_gateway_routes(clients, config):
+    """ Deletes all routes for a given API Gateway API. """
+    api_id = config.get('API_ID')
+    if not api_id:
+        print("--- No API_ID found, skipping API Gateway route deletion ---")
+        return
+
+    print(f"--- Deleting routes for API Gateway: {api_id} ---")
+    try:
+        response = clients['apigatewayv2'].get_routes(ApiId=api_id)
+        routes = response.get('Items', [])
+        if not routes:
+            print("No routes found.")
+            return
+
+        for route in routes:
+            route_id = route['RouteId']
+            print(f"Deleting route: {route_id}")
+            clients['apigatewayv2'].delete_route(ApiId=api_id, RouteId=route_id)
+        print("All routes deleted successfully.")
+    except clients['apigatewayv2'].exceptions.NotFoundException:
+        print(f"API Gateway {api_id} not found. Skipping route deletion.")
+    except Exception as e:
+        print(f"An error occurred while deleting API Gateway routes: {e}")
+
+
+def disassociate_capacity_providers_from_cluster(clients, config):
+    """ Disassociates all capacity providers from the ECS cluster. """
+    cluster_name = config.get('CLUSTER_NAME')
+    print(f"--- Disassociating capacity providers from cluster: {cluster_name} ---")
+    try:
+        # This action effectively detaches the aws_ecs_cluster_capacity_providers resource
+        clients['ecs'].put_cluster_capacity_providers(
+            cluster=cluster_name,
+            capacityProviders=[],
+            defaultCapacityProviderStrategy=[]
+        )
+        print(f"Successfully disassociated all capacity providers from {cluster_name}.")
+        # Give it a moment to process the update before deleting the provider
+        time.sleep(15)
+    except clients['ecs'].exceptions.ClusterNotFoundException:
+        print(f"Cluster {cluster_name} not found. Skipping disassociation.")
+    except Exception as e:
+        print(f"An error occurred while disassociating capacity providers: {e}")
+
+
 def delete_api_gateway(clients, config):
     """ Deletes the API Gateway API. """
     api_id = config.get('API_ID')
@@ -130,7 +201,7 @@ def delete_ecs_service(clients, config):
         print(f"An error occurred while deleting ECS service: {e}")
 
 
-def delete_autoscaling_group_and_instances(clients, config, max_wait_minutes=15):
+def delete_autoscaling_group_and_instances_old(clients, config, max_wait_minutes=15):
     print(f"--- Handling Auto Scaling Group starting with: {config['ASG_NAME_PREFIX']} ---")
     try:
         response = clients['autoscaling'].describe_auto_scaling_groups()
@@ -168,6 +239,88 @@ def delete_autoscaling_group_and_instances(clients, config, max_wait_minutes=15)
         print("Deleting the ASG (force delete)...")
         clients['autoscaling'].delete_auto_scaling_group(AutoScalingGroupName=asg_name, ForceDelete=True)
         print(f"Auto Scaling Group {asg_name} deleted successfully.")
+    except Exception as e:
+        print(f"An error occurred during ASG deletion: {e}")
+
+def delete_autoscaling_group_and_instances(clients, config, max_wait_minutes=15):
+    print(f"--- Handling Auto Scaling Group starting with: {config['ASG_NAME_PREFIX']} ---")
+    try:
+        # 1. Find the ASG
+        response = clients['autoscaling'].describe_auto_scaling_groups()
+        asg_details = next((asg for asg in response['AutoScalingGroups'] 
+                            if asg['AutoScalingGroupName'].startswith(config['ASG_NAME_PREFIX'])), None)
+        
+        if not asg_details:
+            print("No matching Auto Scaling Group found. Skipping.")
+            return
+            
+        asg_name = asg_details['AutoScalingGroupName']
+        print(f"Found ASG: {asg_name}")
+
+        # 2. CRITICAL FIX: Remove Scale-In Protection from existing instances
+        # Without this, the ASG will refuse to terminate instances, causing the 15min wait and subsequent errors.
+        instance_ids = [i['InstanceId'] for i in asg_details.get('Instances', [])]
+        if instance_ids:
+            print(f"Found {len(instance_ids)} protected instances. Removing scale-in protection...")
+            try:
+                clients['autoscaling'].set_instance_protection(
+                    AutoScalingGroupName=asg_name,
+                    InstanceIds=instance_ids,
+                    ProtectedFromScaleIn=False
+                )
+                print("Protection removed successfully.")
+            except Exception as e:
+                print(f"Warning: Could not remove protection (instances might already be terminating): {e}")
+
+        # 3. Update ASG to size 0
+        print("Setting ASG min/max/desired to 0...")
+        clients['autoscaling'].update_auto_scaling_group(
+            AutoScalingGroupName=asg_name, 
+            MinSize=0, 
+            MaxSize=0, 
+            DesiredCapacity=0,
+            NewInstancesProtectedFromScaleIn=False # Prevent new ones from being locked
+        )
+
+        # 4. Wait for termination
+        print("Waiting for all instances in the ASG to terminate...")
+        start_time = time.time()
+        while True:
+            # Re-fetch ASG details to check instance list
+            try:
+                asg_desc_list = clients['autoscaling'].describe_auto_scaling_groups(
+                    AutoScalingGroupNames=[asg_name]
+                )['AutoScalingGroups']
+            except Exception:
+                # If ASG is gone, we are done
+                print("ASG no longer found. Assuming deleted.")
+                break
+                
+            if not asg_desc_list:
+                break
+                
+            current_instances = asg_desc_list[0].get('Instances', [])
+            
+            # Filter out instances that are already Terminated (they might linger in the API list for an hour)
+            active_instances = [i for i in current_instances if i['LifecycleState'] not in ['Terminated']]
+
+            if not active_instances:
+                print("All instances have been terminated.")
+                break
+
+            elapsed = time.time() - start_time
+            if elapsed > max_wait_minutes * 60:
+                print(f" Timeout reached ({max_wait_minutes} min). Proceeding to force delete the ASG...")
+                break
+
+            print(f"{len(active_instances)} instance(s) still active... waiting 30 seconds.")
+            time.sleep(30)
+
+        # 5. Delete the ASG
+        print("Deleting the ASG...")
+        clients['autoscaling'].delete_auto_scaling_group(AutoScalingGroupName=asg_name, ForceDelete=True)
+        print(f"Auto Scaling Group {asg_name} deleted successfully.")
+        
     except Exception as e:
         print(f"An error occurred during ASG deletion: {e}")
 
@@ -229,9 +382,19 @@ def delete_capacity_providers(clients, config):
 def delete_ecs_cluster(clients, config):
     print(f"--- Deleting ECS Cluster: {config['CLUSTER_NAME']} ---")
     try:
+        # Ensure there are no services or tasks left.
+        # This is a safeguard; delete_ecs_service should have handled it.
+        services_response = clients['ecs'].list_services(cluster=config['CLUSTER_NAME'])
+        if services_response.get('serviceArns'):
+            print(f"ERROR: Cluster {config['CLUSTER_NAME']} still has active services. Aborting cluster deletion.")
+            return
+
+        print(f"Proceeding with deletion of cluster: {config['CLUSTER_NAME']}")
         clients['ecs'].delete_cluster(cluster=config['CLUSTER_NAME'])
-        waiter = clients['ecs'].get_waiter('clusters_inactive')
-        waiter.wait(clusters=[config['CLUSTER_NAME']], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
+        
+        waiter = clients['ecs'].get_waiter('clusters_deleted') 
+        
+        waiter.wait(clusters=[config['CLUSTER_NAME']], WaiterConfig={'Delay': 15, 'MaxAttempts': 60})
         print(f"Cluster {config['CLUSTER_NAME']} deleted successfully.")
     except clients['ecs'].exceptions.ClusterNotFoundException:
         print(f"Cluster {config['CLUSTER_NAME']} not found. Skipping.")
@@ -307,17 +470,45 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Programmatically destroy AWS resources for a Terraform project.")
     parser.add_argument("path", help="The relative or absolute path to the Terraform project directory.")
     parser.add_argument("--use-terragrunt", action="store_true", help="Use 'terragrunt' CLI instead of 'terraform'.")
+    parser.add_argument("--manual-config", action="store_true", help="Use hardcoded/manual resource names.")
     args = parser.parse_args()
 
     if not os.path.isdir(args.path):
         print(f"Error: The provided path '{args.path}' is not a valid directory.")
         exit(1)
 
-    # config = get_config_from_terraform(args.path, use_terragrunt=args.use_terragrunt)
-    config = get_config_from_terraform(args.path, True)
-    if not config:
-        print("\nAborting due to configuration errors.")
-        exit(1)
+
+
+    # LOGIC TO SWITCH BETWEEN MODES
+    if args.manual_config:
+        print("!!! RUNNING IN MANUAL RECOVERY MODE !!!")
+        config = {
+            "AWS_REGION": "ca-central-1",
+                        
+            "CLUSTER_NAME": "btap-app-test3-dev-tgw-3-cluster",
+            "ASG_NAME_PREFIX": "btap-app-test3-dev-tgw-3-asg-",
+            "LAUNCH_TEMPLATE_PREFIX": "btap-app-test3-dev-tgw-3-lt-",
+            # IMPORTANT:  "vpc-0809102c90503ef2d"  # From NRCan's info; confirm if needed. "vpc-0c095736cf65241cb" is BSUPs resource
+            "VPC_ID": "vpc-0c095736cf65241cb",
+            "ALB_SG_NAME": "btap-app-test3-dev-tgw-3-alb-sg",
+            "ECS_SG_NAME": "btap-app-test3-dev-tgw-3-ecs-sg",
+            
+            "SERVICE_NAME": "btap-app-test3-dev-tgw-3-service", 
+            "ALB_NAME": "btap-app-test3-dev-tgw-3-alb",
+            "TARGET_GROUP_NAME": "btap-app-test3-dev-tgw-3-tg",
+            
+            # Set these to empty strings or dummy values if unknown; 
+            # the script will try to delete them
+            "API_ID": "", 
+            "VPC_LINK_ID": "",
+            "CAPACITY_PROVIDER_NAME": "btap-app-test3-dev-tgw-3-capacity-provider"
+        }
+    else:        
+        # config = get_config_from_terraform(args.path, use_terragrunt=args.use_terragrunt)
+        config = get_config_from_terraform(args.path, True)
+        if not config:
+            print("\nAborting due to configuration errors.")
+            exit(1)        
     
     # This config is no longer needed as we have a direct name.
     # config['CAPACITY_PROVIDER_NAME'] = f"{config.get('BASE_NAME')}-capacity-provider"
@@ -330,42 +521,45 @@ if __name__ == '__main__':
     
     print("\n>>> Starting AWS Resource Destruction Script <<<")
     
-    # ----------------- UPDATED CRITICAL DESTRUCTION ORDER -----------------
+    # ----------------- REVISED AND CORRECTED DESTRUCTION ORDER -----------------
     
     # 1. Remove service auto-scaling dependencies first.
     delete_appautoscaling_policies_and_targets(clients, config)
     
-    # 2. Scale down and delete the ECS service.
+    # 2. Scale down and delete the ECS service. This detaches it from the Target Group.
     delete_ecs_service(clients, config)
     
-    # 3. NEW: Delete the API Gateway, which depends on the ALB listener.
+    # 3. NEW: Delete API Gateway components that depend on the ALB Listener.
+    # The integration is the key dependency on the listener.
+    delete_api_gateway_integrations(clients, config)
+    delete_api_gateway_routes(clients, config)
     delete_api_gateway(clients, config)
     
-    # 4. NEW: Delete the VPC Link, which depends on subnets and SGs.
-    #    It must be deleted before the ALB and SGs it might reference.
+    # 4. Now that the API Gateway is gone, delete the ALB and its Target Group.
+    delete_load_balancer_and_target_group(clients, config)
+
+    # 5. The VPC Link is no longer in use by the API Gateway.
     delete_vpc_link(clients, config)
 
-    # 5. Scale down and delete the ASG, terminating all EC2 instances.
+    # 6. Scale down and delete the ASG, terminating all EC2 instances.
     delete_autoscaling_group_and_instances(clients, config)
-    
-    # 6. Delete the ALB and Target Group.
-    delete_load_balancer_and_target_group(clients, config)
     
     # 7. Delete the Launch Template.
     delete_launch_template(clients, config)
     
-    # 8. Delete the Capacity Provider.
-    # Note: Ensure CAPACITY_PROVIDER_NAME is set in your config if you use it.
-    # This script will attempt to guess it if not present.
+    # 8. NEW: Disassociate the Capacity Provider from the Cluster BEFORE deleting it.
+    disassociate_capacity_providers_from_cluster(clients, config)
+    
+    # 9. Now delete the Capacity Provider itself.
     delete_capacity_providers(clients, config)
     
-    # 9. Delete the now-empty ECS Cluster.
+    # 10. Delete the now-empty and un-associated ECS Cluster.
     delete_ecs_cluster(clients, config)
     
     print("\n--- SKIPPING IAM ROLE DELETION BY DEFAULT (This is a safe practice) ---")
     
-    # 10. Clean up networking resources created by this stack.
-    vpc_id = config.get('VPC_ID') # UPDATED: Get VPC ID directly from config.
+    # 11. Clean up networking resources created by this stack.
+    vpc_id = config.get('VPC_ID')
     if vpc_id:
         print("\nWaiting 60 seconds for network interfaces to detach before deleting security groups...")
         time.sleep(60)

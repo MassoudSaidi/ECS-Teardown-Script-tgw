@@ -44,3 +44,15 @@ Before running, ensure the following are installed and configured:
   ```
 
 
+## Recovery terragrunt information is lost
+Since the previous destroy attempt wiped the Terraform state, the script cannot automatically find the resources to delete.
+ 
+To fix this, I have added a Manual Configuration Mode to the script.
+ 
+1. Open smart_nuke.py.
+2. Review the manual_config dictionary inside the if args.manual_config: block (line ~ 457 I have pre-filled this based on our previous test run).
+3. Run the script in recovery mode:
+```bash
+  $env:AWS_CONFIG_FILE = ".\.aws\config" ; $env:AWS_SHARED_CREDENTIALS_FILE = ".\.aws\credentials" ; $env:AWS_PROFILE = "dev"
+  python [your root for scripts]/python smart_nuke.py [your-path-to]\infrastructure\live\dev --manual-config
+```

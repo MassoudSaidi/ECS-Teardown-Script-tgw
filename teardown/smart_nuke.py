@@ -201,44 +201,95 @@ def delete_ecs_service(clients, config):
         print(f"An error occurred while deleting ECS service: {e}")
 
 
-def delete_autoscaling_group_and_instances(clients, config, max_wait_minutes=15):
+def delete_autoscaling_group_and_instances(clients, config, max_wait_minutes=5): # CHANGED TO 5
     print(f"--- Handling Auto Scaling Group starting with: {config['ASG_NAME_PREFIX']} ---")
     try:
+        # 1. Find the ASG
         response = clients['autoscaling'].describe_auto_scaling_groups()
         asg_details = next((asg for asg in response['AutoScalingGroups'] 
                             if asg['AutoScalingGroupName'].startswith(config['ASG_NAME_PREFIX'])), None)
+        
         if not asg_details:
             print("No matching Auto Scaling Group found. Skipping.")
             return
+            
         asg_name = asg_details['AutoScalingGroupName']
-        print(f"Found ASG: {asg_name}. Setting min/max/desired to 0...")
-        clients['autoscaling'].update_auto_scaling_group(
-            AutoScalingGroupName=asg_name, MinSize=0, MaxSize=0, DesiredCapacity=0
-        )
-        time.sleep(5)
-        print("Waiting for all instances in the ASG to terminate...")
+        print(f"Found ASG: {asg_name}")
 
+        # 2. Remove Scale-In Protection
+        instance_ids = [i['InstanceId'] for i in asg_details.get('Instances', [])]
+        if instance_ids:
+            try:
+                clients['autoscaling'].set_instance_protection(
+                    AutoScalingGroupName=asg_name, InstanceIds=instance_ids, ProtectedFromScaleIn=False
+                )
+            except Exception:
+                pass # Ignore if already terminating
+
+        # 3. Delete Lifecycle Hooks (Pre-emptive)
+        try:
+            hooks = clients['autoscaling'].describe_lifecycle_hooks(AutoScalingGroupName=asg_name)['LifecycleHooks']
+            for hook in hooks:
+                clients['autoscaling'].delete_lifecycle_hook(
+                    AutoScalingGroupName=asg_name, LifecycleHookName=hook['LifecycleHookName']
+                )
+        except Exception:
+            pass
+
+        # 4. Update ASG to size 0
+        print("Setting ASG min/max/desired to 0...")
+        clients['autoscaling'].update_auto_scaling_group(
+            AutoScalingGroupName=asg_name, MinSize=0, MaxSize=0, DesiredCapacity=0, NewInstancesProtectedFromScaleIn=False
+        )
+
+        # 5. Wait for termination
+        print("Waiting for all instances in the ASG to terminate...")
         start_time = time.time()
+        
         while True:
-            asg_desc = clients['autoscaling'].describe_auto_scaling_groups(
-                AutoScalingGroupNames=[asg_name]
-            )['AutoScalingGroups'][0]
-            instances = asg_desc.get('Instances', [])
-            if not instances:
+            try:
+                asg_desc_list = clients['autoscaling'].describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])['AutoScalingGroups']
+            except Exception:
+                break # ASG Gone
+                
+            if not asg_desc_list: break
+                
+            current_instances = asg_desc_list[0].get('Instances', [])
+            active_instances = [i for i in current_instances if i['LifecycleState'] not in ['Terminated']]
+
+            if not active_instances:
                 print("All instances have been terminated.")
                 break
+
+            # HANDLE STUCK HOOKS
+            for inst in active_instances:
+                if inst['LifecycleState'] == 'Terminating:Wait':
+                    print(f"Instance {inst['InstanceId']} stuck in Wait. Forcing CONTINUE...")
+                    try:
+                        hooks_resp = clients['autoscaling'].describe_lifecycle_hooks(AutoScalingGroupName=asg_name)
+                        for hook in hooks_resp.get('LifecycleHooks', []):
+                            clients['autoscaling'].complete_lifecycle_action(
+                                LifecycleHookName=hook['LifecycleHookName'],
+                                AutoScalingGroupName=asg_name,
+                                LifecycleActionResult='CONTINUE',
+                                InstanceId=inst['InstanceId']
+                            )
+                    except Exception:
+                        pass
 
             elapsed = time.time() - start_time
             if elapsed > max_wait_minutes * 60:
                 print(f" Timeout reached ({max_wait_minutes} min). Proceeding to force delete the ASG...")
                 break
 
-            print(f"{len(instances)} instance(s) still terminating... waiting 30 seconds.")
-            time.sleep(30)
+            print(f"{len(active_instances)} instance(s) still active... waiting 15 seconds.")
+            time.sleep(15)
 
-        print("Deleting the ASG (force delete)...")
+        # 6. Delete the ASG
+        print("Deleting the ASG...")
         clients['autoscaling'].delete_auto_scaling_group(AutoScalingGroupName=asg_name, ForceDelete=True)
         print(f"Auto Scaling Group {asg_name} deleted successfully.")
+        
     except Exception as e:
         print(f"An error occurred during ASG deletion: {e}")
 
@@ -300,8 +351,7 @@ def delete_capacity_providers(clients, config):
 def delete_ecs_cluster(clients, config):
     print(f"--- Deleting ECS Cluster: {config['CLUSTER_NAME']} ---")
     try:
-        # Ensure there are no services or tasks left.
-        # This is a safeguard; delete_ecs_service should have handled it.
+        # Check if services exist (safety check)
         services_response = clients['ecs'].list_services(cluster=config['CLUSTER_NAME'])
         if services_response.get('serviceArns'):
             print(f"ERROR: Cluster {config['CLUSTER_NAME']} still has active services. Aborting cluster deletion.")
@@ -310,10 +360,17 @@ def delete_ecs_cluster(clients, config):
         print(f"Proceeding with deletion of cluster: {config['CLUSTER_NAME']}")
         clients['ecs'].delete_cluster(cluster=config['CLUSTER_NAME'])
         
-        waiter = clients['ecs'].get_waiter('clusters_deleted') 
+        # Manually wait for deletion since 'clusters_deleted' waiter doesn't exist
+        print("Cluster delete request sent. Waiting 20 seconds for propagation...")
+        time.sleep(20)
         
-        waiter.wait(clusters=[config['CLUSTER_NAME']], WaiterConfig={'Delay': 15, 'MaxAttempts': 60})
-        print(f"Cluster {config['CLUSTER_NAME']} deleted successfully.")
+        # Verification
+        try:
+            clients['ecs'].describe_clusters(clusters=[config['CLUSTER_NAME']])
+            print("Warning: Cluster might still exist (AWS is slow to delete). It should disappear shortly.")
+        except clients['ecs'].exceptions.ClusterNotFoundException:
+            print(f"Cluster {config['CLUSTER_NAME']} deleted successfully.")
+
     except clients['ecs'].exceptions.ClusterNotFoundException:
         print(f"Cluster {config['CLUSTER_NAME']} not found. Skipping.")
     except Exception as e:
@@ -343,9 +400,9 @@ def delete_security_groups(clients, vpc_id, config):
 
 # REMOVED: get_vpc_id_by_name is no longer needed as we get the ID directly.
 
-def get_config_from_terraform(folder_path, use_terragrunt=False): # Defaulting use_terragrunt to False
-    # command_name = "terragrunt" if use_terragrunt else "terraform"
-    command_name = "terragrunt"
+def get_config_from_terraform(folder_path, use_terragrunt=True): # Defaulting use_terragrunt to False
+    command_name = "terragrunt" if use_terragrunt else "terraform"
+    # command_name = "terragrunt"
     print(f"--- Getting configuration from {command_name} output in: {folder_path} ---")
     try:
         if not use_terragrunt:
@@ -386,19 +443,46 @@ def get_config_from_terraform(folder_path, use_terragrunt=False): # Defaulting u
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Programmatically destroy AWS resources for a Terraform project.")
-    parser.add_argument("path", help="The relative or absolute path to the Terraform project directory.")
-    parser.add_argument("--use-terragrunt", action="store_true", help="Use 'terragrunt' CLI instead of 'terraform'.")
+    parser.add_argument("path", help="The relative or absolute path to the Terraform project directory.")    
+    parser.add_argument("--manual-config", action="store_true", help="Use hardcoded/manual resource names.")
     args = parser.parse_args()
 
     if not os.path.isdir(args.path):
         print(f"Error: The provided path '{args.path}' is not a valid directory.")
         exit(1)
 
-    # config = get_config_from_terraform(args.path, use_terragrunt=args.use_terragrunt)
-    config = get_config_from_terraform(args.path, True)
-    if not config:
-        print("\nAborting due to configuration errors.")
-        exit(1)
+
+
+    # LOGIC TO SWITCH BETWEEN MODES
+    if args.manual_config:
+        print("!!! RUNNING IN MANUAL RECOVERY MODE !!!")
+        config = {
+            "AWS_REGION": "ca-central-1",
+                        
+            "CLUSTER_NAME": "btap-app-test3-dev-tgw-3-cluster",
+            "ASG_NAME_PREFIX": "btap-app-test3-dev-tgw-3-asg-",
+            "LAUNCH_TEMPLATE_PREFIX": "btap-app-test3-dev-tgw-3-lt-",
+            # IMPORTANT:  "vpc-0809102c90503ef2d"  # From NRCan's info; confirm if needed. "vpc-0c095736cf65241cb" is BSUPs resource
+            "VPC_ID": "vpc-0809102c90503ef2d",
+            "ALB_SG_NAME": "btap-app-test3-dev-tgw-3-alb-sg",
+            "ECS_SG_NAME": "btap-app-test3-dev-tgw-3-ecs-sg",
+            
+            "SERVICE_NAME": "btap-app-test3-dev-tgw-3-service", 
+            "ALB_NAME": "btap-app-test3-dev-tgw-3-alb",
+            "TARGET_GROUP_NAME": "btap-app-test3-dev-tgw-3-tg",
+            
+            # Set these to empty strings if unknown; 
+            # the script will try to delete them
+            "API_ID": "", 
+            "VPC_LINK_ID": "",
+            "CAPACITY_PROVIDER_NAME": "btap-app-test3-dev-tgw-3-capacity-provider"
+        }
+    else:        
+        # config = get_config_from_terraform(args.path, use_terragrunt=args.use_terragrunt)
+        config = get_config_from_terraform(args.path, True)
+        if not config:
+            print("\nAborting due to configuration errors.")
+            exit(1)        
     
     # This config is no longer needed as we have a direct name.
     # config['CAPACITY_PROVIDER_NAME'] = f"{config.get('BASE_NAME')}-capacity-provider"
